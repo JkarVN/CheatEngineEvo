@@ -69,6 +69,7 @@ jobs:
     env:
       CE_TAG:     ${{ needs.check-version.outputs.ce_tag }}
       CE_VERSION: ${{ needs.check-version.outputs.ce_version }}
+      # Lazarus 3.6 đi kèm FPC 3.2.2
       LAZARUS_VERSION: "3.6"
       FPC_VERSION: "3.2.2"
 
@@ -79,37 +80,77 @@ jobs:
 
       # ── 2. Clone source CE gốc theo tag ──
       - name: Clone Cheat Engine source (tag ${{ env.CE_TAG }})
+        shell: pwsh
         run: |
           git clone --depth 1 --branch ${{ env.CE_TAG }} `
             https://github.com/cheat-engine/cheat-engine.git `
             ce-source
-          echo "✅ CE source cloned at tag ${{ env.CE_TAG }}"
+          Write-Host "✅ CE source cloned at tag ${{ env.CE_TAG }}"
 
-      # ── 3. Cache Lazarus installer ──
-      - name: Cache Lazarus installer
+      # ── 3. Cache thư mục Lazarus đã cài ──
+      - name: Cache Lazarus installation
         id: cache-lazarus
         uses: actions/cache@v4
         with:
-          path: lazarus-installer.exe
-          key: lazarus-${{ env.LAZARUS_VERSION }}-fpc-${{ env.FPC_VERSION }}-win64
+          path: C:\lazarus
+          key: lazarus-${{ env.LAZARUS_VERSION }}-fpc-${{ env.FPC_VERSION }}-win64-installed
 
-      # ── 4. Download Lazarus (nếu chưa có cache) ──
-      - name: Download Lazarus ${{ env.LAZARUS_VERSION }}
+      # ── 4. Download & Install Lazarus (nếu chưa có cache) ──
+      - name: Download & Install Lazarus ${{ env.LAZARUS_VERSION }}
         if: steps.cache-lazarus.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $url = "https://sourceforge.net/projects/lazarus/files/Lazarus%20Windows%2064%20bits/${{ env.LAZARUS_VERSION }}/lazarus-${{ env.LAZARUS_VERSION }}-fpc-${{ env.FPC_VERSION }}-win64.exe/download"
-          Write-Host "Downloading Lazarus from: $url"
-          Invoke-WebRequest -Uri $url -OutFile "lazarus-installer.exe" -UseBasicParsing
-          Write-Host "✅ Lazarus downloaded"
+          $version  = "${{ env.LAZARUS_VERSION }}"
+          $fpcVer   = "${{ env.FPC_VERSION }}"
+          $filename = "lazarus-$version-fpc-$fpcVer-win64.exe"
 
-      # ── 5. Cài Lazarus ──
-      - name: Install Lazarus silently
-        shell: cmd
-        run: |
-          echo Installing Lazarus ${{ env.LAZARUS_VERSION }}...
-          lazarus-installer.exe /verysilent /norestart /dir=C:\lazarus
-          echo ✅ Lazarus installed
+          # Danh sách mirror SourceForge (URL trực tiếp, không dùng /download redirect)
+          $mirrors = @(
+            "https://downloads.sourceforge.net/project/lazarus/Lazarus%20Windows%2064%20bits/Lazarus%20$version/$filename",
+            "https://freefr.dl.sourceforge.net/project/lazarus/Lazarus%20Windows%2064%20bits/Lazarus%20$version/$filename",
+            "https://netix.dl.sourceforge.net/project/lazarus/Lazarus%20Windows%2064%20bits/Lazarus%20$version/$filename",
+            "https://phoenixnap.dl.sourceforge.net/project/lazarus/Lazarus%20Windows%2064%20bits/Lazarus%20$version/$filename"
+          )
+
+          $downloaded = $false
+          foreach ($url in $mirrors) {
+            Write-Host "⬇️  Trying mirror: $url"
+            try {
+              Invoke-WebRequest -Uri $url -OutFile "lazarus-installer.exe" `
+                -UseBasicParsing -TimeoutSec 180 -ErrorAction Stop
+
+              # Xác nhận file là PE executable (magic bytes: 4D 5A = "MZ")
+              $header = [System.IO.File]::ReadAllBytes("lazarus-installer.exe")[0..1]
+              if ($header[0] -eq 0x4D -and $header[1] -eq 0x5A) {
+                $sizeMB = [math]::Round((Get-Item "lazarus-installer.exe").Length / 1MB, 1)
+                Write-Host "✅ Valid EXE downloaded ($sizeMB MB)"
+                $downloaded = $true
+                break
+              }
+              Write-Warning "⚠️  File is not a valid EXE (probably HTML redirect). Trying next mirror..."
+            } catch {
+              Write-Warning "⚠️  Mirror failed: $_"
+            }
+          }
+
+          if (-not $downloaded) {
+            # Fallback: Chocolatey
+            Write-Host "📦 All SourceForge mirrors failed — using Chocolatey..."
+            choco install lazarus --version=$version -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "Chocolatey install of Lazarus failed" }
+            Write-Host "✅ Lazarus installed via Chocolatey"
+            exit 0
+          }
+
+          # Chạy installer Inno Setup silently
+          Write-Host "🔧 Running Lazarus installer..."
+          $proc = Start-Process -FilePath (Resolve-Path "lazarus-installer.exe") `
+            -ArgumentList "/verysilent", "/norestart", "/dir=C:\lazarus" `
+            -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -ne 0) {
+            throw "Lazarus installer exited with code $($proc.ExitCode)"
+          }
+          Write-Host "✅ Lazarus installed to C:\lazarus"
 
       # ── 6. Verify Lazarus installation ──
       - name: Verify Lazarus installation
