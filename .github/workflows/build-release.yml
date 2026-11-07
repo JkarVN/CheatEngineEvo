@@ -1,0 +1,258 @@
+name: 🚀 Build & Release CheatEngine (Windows)
+
+on:
+  # Chạy thủ công từ tab Actions
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild even if already built this version'
+        required: false
+        default: 'false'
+        type: boolean
+
+  # Kiểm tra phiên bản mới mỗi ngày lúc 00:00 UTC
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: Kiểm tra phiên bản CE mới nhất
+  # ─────────────────────────────────────────────
+  check-version:
+    name: 🔍 Check Latest CE Version
+    runs-on: ubuntu-latest
+    outputs:
+      ce_tag:        ${{ steps.get_version.outputs.ce_tag }}
+      ce_version:    ${{ steps.get_version.outputs.ce_version }}
+      should_build:  ${{ steps.compare.outputs.should_build }}
+
+    steps:
+      - name: Get latest CE release tag
+        id: get_version
+        run: |
+          RESPONSE=$(curl -sSf "https://api.github.com/repos/cheat-engine/cheat-engine/releases/latest")
+          TAG=$(echo "$RESPONSE" | jq -r '.tag_name')
+          NAME=$(echo "$RESPONSE" | jq -r '.name')
+          echo "ce_tag=$TAG"       >> "$GITHUB_OUTPUT"
+          echo "ce_version=$NAME"  >> "$GITHUB_OUTPUT"
+          echo "✅ Latest CE version: $NAME (tag: $TAG)"
+
+      - name: Check if this version was already released
+        id: compare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ github.event.inputs.force_rebuild }}
+        run: |
+          TAG="${{ steps.get_version.outputs.ce_tag }}"
+          # Kiểm tra release tag tương ứng trong repo của chúng ta
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/CE-$TAG")
+
+          if [ "$STATUS" = "200" ] && [ "$FORCE" != "true" ]; then
+            echo "⏭️  CE $TAG đã được build và release trước đó. Bỏ qua."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "🆕 Cần build CE $TAG"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Build trên Windows
+  # ─────────────────────────────────────────────
+  build-windows:
+    name: 🏗️ Build CheatEngine (Windows)
+    runs-on: windows-2022
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
+
+    env:
+      CE_TAG:     ${{ needs.check-version.outputs.ce_tag }}
+      CE_VERSION: ${{ needs.check-version.outputs.ce_version }}
+      LAZARUS_VERSION: "3.6"
+      FPC_VERSION: "3.2.2"
+
+    steps:
+      # ── 1. Checkout repo của chúng ta (để có quyền tạo Release) ──
+      - name: Checkout CheatEngineEvo repo
+        uses: actions/checkout@v4
+
+      # ── 2. Clone source CE gốc theo tag ──
+      - name: Clone Cheat Engine source (tag ${{ env.CE_TAG }})
+        run: |
+          git clone --depth 1 --branch ${{ env.CE_TAG }} `
+            https://github.com/cheat-engine/cheat-engine.git `
+            ce-source
+          echo "✅ CE source cloned at tag ${{ env.CE_TAG }}"
+
+      # ── 3. Cache Lazarus installer ──
+      - name: Cache Lazarus installer
+        id: cache-lazarus
+        uses: actions/cache@v4
+        with:
+          path: lazarus-installer.exe
+          key: lazarus-${{ env.LAZARUS_VERSION }}-fpc-${{ env.FPC_VERSION }}-win64
+
+      # ── 4. Download Lazarus (nếu chưa có cache) ──
+      - name: Download Lazarus ${{ env.LAZARUS_VERSION }}
+        if: steps.cache-lazarus.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://sourceforge.net/projects/lazarus/files/Lazarus%20Windows%2064%20bits/${{ env.LAZARUS_VERSION }}/lazarus-${{ env.LAZARUS_VERSION }}-fpc-${{ env.FPC_VERSION }}-win64.exe/download"
+          Write-Host "Downloading Lazarus from: $url"
+          Invoke-WebRequest -Uri $url -OutFile "lazarus-installer.exe" -UseBasicParsing
+          Write-Host "✅ Lazarus downloaded"
+
+      # ── 5. Cài Lazarus ──
+      - name: Install Lazarus silently
+        shell: cmd
+        run: |
+          echo Installing Lazarus ${{ env.LAZARUS_VERSION }}...
+          lazarus-installer.exe /verysilent /norestart /dir=C:\lazarus
+          echo ✅ Lazarus installed
+
+      # ── 6. Verify Lazarus installation ──
+      - name: Verify Lazarus installation
+        shell: cmd
+        run: |
+          if not exist "C:\lazarus\lazbuild.exe" (
+            echo ❌ lazbuild.exe not found!
+            dir C:\lazarus\
+            exit /b 1
+          )
+          C:\lazarus\lazbuild.exe --version
+          echo ✅ lazbuild OK
+
+      # ── 7. Build dự án CE 32-bit ──
+      - name: Build CheatEngine 32-bit
+        shell: cmd
+        working-directory: ce-source
+        run: |
+          echo ===== Building Cheat Engine 32-bit =====
+          "C:\lazarus\lazbuild.exe" "Cheat Engine\cheatengine.lpi" ^
+            --build-all ^
+            --build-mode="Release 32-Bit" ^
+            --os=win32 --cpu=i386
+          echo ✅ 32-bit build done
+
+      # ── 8. Build dự án CE 64-bit ──
+      - name: Build CheatEngine 64-bit
+        shell: cmd
+        working-directory: ce-source
+        run: |
+          echo ===== Building Cheat Engine 64-bit =====
+          "C:\lazarus\lazbuild.exe" "Cheat Engine\cheatengine.lpi" ^
+            --build-all ^
+            --build-mode="Release 64-Bit" ^
+            --os=win64 --cpu=x86_64
+          echo ✅ 64-bit build done
+
+      # ── 9. Liệt kê thư mục output ──
+      - name: List build output
+        shell: pwsh
+        run: |
+          Write-Host "=== Build output tree ==="
+          Get-ChildItem -Recurse "ce-source\Cheat Engine\bin" -ErrorAction SilentlyContinue |
+            Select-Object FullName, Length | Format-Table -AutoSize
+
+      # ── 10. Package artifacts ──
+      - name: Package build artifacts
+        shell: pwsh
+        run: |
+          $tag = "${{ env.CE_TAG }}"
+          $binDir = "ce-source\Cheat Engine\bin"
+
+          # Tạo thư mục output
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+
+          # Zip toàn bộ bin folder
+          if (Test-Path $binDir) {
+            Compress-Archive -Path "$binDir\*" -DestinationPath "dist\CheatEngineEvo-$tag-windows.zip" -Force
+            Write-Host "✅ Packaged: dist\CheatEngineEvo-$tag-windows.zip"
+          } else {
+            Write-Error "❌ Build output directory not found: $binDir"
+            exit 1
+          }
+
+          # Tạo README ngắn gọn
+          @"
+          # CheatEngine Evo - Windows Build
+          
+          **Source version:** ${{ env.CE_VERSION }}
+          **Built from tag:** $tag
+          **Built by:** CheatEngineEvo CI
+          **Date:** $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')
+          
+          ## Files
+          - \`CheatEngineEvo-$tag-windows.zip\` — Windows binaries (32-bit + 64-bit)
+          
+          ## Source
+          Official Cheat Engine: https://github.com/cheat-engine/cheat-engine/tree/$tag
+          "@ | Out-File -Encoding UTF8 "dist\RELEASE_NOTES.md"
+
+      # ── 11. Upload artifacts tạm thời (giữa jobs) ──
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ce-windows-${{ env.CE_TAG }}
+          path: dist/
+          retention-days: 7
+
+  # ─────────────────────────────────────────────
+  # JOB 3: Tạo GitHub Release
+  # ─────────────────────────────────────────────
+  create-release:
+    name: 📦 Create GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - check-version
+      - build-windows
+    if: needs.check-version.outputs.should_build == 'true'
+    permissions:
+      contents: write
+
+    env:
+      CE_TAG:     ${{ needs.check-version.outputs.ce_tag }}
+      CE_VERSION: ${{ needs.check-version.outputs.ce_version }}
+
+    steps:
+      # ── 1. Download artifact từ job build ──
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ce-windows-${{ env.CE_TAG }}
+          path: dist/
+
+      - name: List downloaded files
+        run: ls -lh dist/
+
+      # ── 2. Đọc release notes ──
+      - name: Read release notes
+        id: notes
+        run: |
+          if [ -f "dist/RELEASE_NOTES.md" ]; then
+            NOTES=$(cat dist/RELEASE_NOTES.md)
+          else
+            NOTES="Automated build of Cheat Engine ${{ env.CE_VERSION }} for Windows."
+          fi
+          # Lưu vào file để tránh vấn đề escape
+          echo "$NOTES" > release_body.md
+          echo "✅ Release notes ready"
+
+      # ── 3. Tạo GitHub Release và upload file ──
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "CE-${{ env.CE_TAG }}"
+          name: "CheatEngine Evo ${{ env.CE_VERSION }} (Windows)"
+          body_path: release_body.md
+          draft: false
+          prerelease: false
+          files: |
+            dist/CheatEngineEvo-${{ env.CE_TAG }}-windows.zip
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: ✅ Release created successfully
+        run: |
+          echo "🎉 Release CE-${{ env.CE_TAG }} created!"
+          echo "🔗 https://github.com/${{ github.repository }}/releases/tag/CE-${{ env.CE_TAG }}"
