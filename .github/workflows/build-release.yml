@@ -184,18 +184,87 @@ jobs:
           }
           exit 0
 
+      # ── 8. Build các Lazarus sub-projects phụ trợ (Speedhack, VEHDebug, WindowsRepair...) ──
+      - name: Build auxiliary Lazarus projects
+        shell: pwsh
+        continue-on-error: true
+        working-directory: ce-source
+        run: |
+          $lpis = Get-ChildItem -Recurse -Filter "*.lpi" |
+            Where-Object { $_.Name -notmatch 'cheatengine\.lpi' }
+          Write-Host "Found $($lpis.Count) auxiliary LPI project(s):"
+          $lpis | ForEach-Object { Write-Host " - $($_.FullName)" }
+          foreach ($p in $lpis) {
+            Write-Host "`n▶ Building helper project: $($p.Name)..."
+            lazbuild $p.FullName --build-all
+          }
 
-      # ── 8. Tìm và liệt kê output binaries ──
+      # ── 9. Setup MSBuild để build TCC Lib và C/C++ helpers ──
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # ── 10. Build Visual Studio solutions (TCC library, MonoDataCollector...) ──
+      - name: Build C/C++ helper solutions (TCC, collectors)
+        shell: pwsh
+        continue-on-error: true
+        working-directory: ce-source
+        run: |
+          $slns = Get-ChildItem -Recurse -Filter "*.sln"
+          Write-Host "Found $($slns.Count) solution file(s):"
+          $slns | ForEach-Object { Write-Host " - $($_.FullName)" }
+          foreach ($sln in $slns) {
+            Write-Host "`n========================================================"
+            Write-Host "Building $($sln.Name)..."
+            Write-Host "========================================================"
+            # Build x64
+            msbuild $sln.FullName /p:Configuration=Release /p:Platform=x64 /maxcpucount /v:m
+            # Build Win32 / 32-bit
+            msbuild $sln.FullName /p:Configuration=Release /p:Platform=Win32 /maxcpucount /v:m
+          }
+
+      # ── 11. Thu gom và đồng bộ đầy đủ các DLL, headers, helpers vào bin ──
+      - name: Sync all helper DLLs and dependencies into bin
+        shell: pwsh
+        run: |
+          $binDir = Resolve-Path "ce-source\Cheat Engine\bin"
+          Write-Host "Target bin directory: $binDir"
+
+          # 1. Quét copy tất cả file dll, exe, sys, boe được build từ các thư mục con vào bin
+          Get-ChildItem -Path "ce-source" -Recurse -Include "*.dll","*.sys","*.boe" | ForEach-Object {
+            if ($_.DirectoryName -ne $binDir.Path) {
+              $dest = Join-Path $binDir.Path $_.Name
+              if (-not (Test-Path $dest)) {
+                Copy-Item -Path $_.FullName -Destination $dest -Force
+                Write-Host "Copied helper: $($_.Name) -> bin"
+              }
+            }
+          }
+
+          # 2. Copy các thư mục include, lib, autorun, languages, tcc nếu có ở cấp source
+          $subDirs = @("include", "lib", "autorun", "languages", "clibs", "tcc")
+          foreach ($d in $subDirs) {
+            $foundDirs = Get-ChildItem -Path "ce-source" -Recurse -Directory -Filter $d |
+              Where-Object { $_.FullName -notmatch '\\bin\\' }
+            foreach ($src in $foundDirs) {
+              $target = Join-Path $binDir.Path $d
+              if (-not (Test-Path $target)) {
+                Copy-Item -Path $src.FullName -Destination $target -Recurse -Force
+                Write-Host "Copied dependency folder: $($src.FullName) -> $target"
+                break
+              }
+            }
+          }
+
+      # ── 12. Tìm và liệt kê output binaries ──
       - name: List build output
         shell: pwsh
         run: |
-          Write-Host "=== Searching for built binaries ==="
-          Get-ChildItem "ce-source" -Recurse -Include "*.exe","*.dll" |
-            Where-Object { $_.DirectoryName -match 'bin|output|release' -or $_.Name -match 'cheat' } |
-            Select-Object FullName, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}} |
+          Write-Host "=== Searching for built binaries in bin ==="
+          Get-ChildItem "ce-source\Cheat Engine\bin" -Recurse |
+            Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}, DirectoryName |
             Format-Table -AutoSize
 
-      # ── 9. Package artifacts ──
+      # ── 13. Package artifacts ──
       - name: Package build artifacts
         shell: pwsh
         run: |
@@ -221,7 +290,7 @@ jobs:
           $sizeMB = [math]::Round((Get-Item $zipPath).Length / 1MB, 1)
           Write-Host "✅ Packaged: $zipPath ($sizeMB MB)"
 
-      # ── 10. Upload artifact ──
+      # ── 14. Upload artifact ──
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
