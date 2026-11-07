@@ -22,38 +22,38 @@ jobs:
     name: 🔍 Check Latest CE Version
     runs-on: ubuntu-latest
     outputs:
-      ce_tag:        ${{ steps.get_version.outputs.ce_tag }}
-      ce_version:    ${{ steps.get_version.outputs.ce_version }}
-      should_build:  ${{ steps.compare.outputs.should_build }}
+      ce_tag:       ${{ steps.get_version.outputs.ce_tag }}
+      ce_version:   ${{ steps.get_version.outputs.ce_version }}
+      should_build: ${{ steps.compare.outputs.should_build }}
 
     steps:
       - name: Get latest CE release tag
         id: get_version
         run: |
-          RESPONSE=$(curl -sSf "https://api.github.com/repos/cheat-engine/cheat-engine/releases/latest")
-          TAG=$(echo "$RESPONSE" | jq -r '.tag_name')
+          RESPONSE=$(curl -sSf \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/cheat-engine/cheat-engine/releases/latest")
+          TAG=$(echo "$RESPONSE"  | jq -r '.tag_name')
           NAME=$(echo "$RESPONSE" | jq -r '.name')
-          echo "ce_tag=$TAG"       >> "$GITHUB_OUTPUT"
-          echo "ce_version=$NAME"  >> "$GITHUB_OUTPUT"
-          echo "✅ Latest CE version: $NAME (tag: $TAG)"
+          echo "ce_tag=$TAG"      >> "$GITHUB_OUTPUT"
+          echo "ce_version=$NAME" >> "$GITHUB_OUTPUT"
+          echo "✅ Latest CE: $NAME  (tag: $TAG)"
 
-      - name: Check if this version was already released
+      - name: Check if already released
         id: compare
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FORCE: ${{ github.event.inputs.force_rebuild }}
         run: |
           TAG="${{ steps.get_version.outputs.ce_tag }}"
-          # Kiểm tra release tag tương ứng trong repo của chúng ta
+          FORCE="${{ github.event.inputs.force_rebuild }}"
+
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/releases/tags/CE-$TAG")
 
           if [ "$STATUS" = "200" ] && [ "$FORCE" != "true" ]; then
-            echo "⏭️  CE $TAG đã được build và release trước đó. Bỏ qua."
+            echo "⏭️  CE $TAG already released — skipping."
             echo "should_build=false" >> "$GITHUB_OUTPUT"
           else
-            echo "🆕 Cần build CE $TAG"
+            echo "🆕 Need to build CE $TAG"
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -69,170 +69,139 @@ jobs:
     env:
       CE_TAG:     ${{ needs.check-version.outputs.ce_tag }}
       CE_VERSION: ${{ needs.check-version.outputs.ce_version }}
-      # Lazarus 3.6 đi kèm FPC 3.2.2
-      LAZARUS_VERSION: "3.6"
-      FPC_VERSION: "3.2.2"
 
     steps:
-      # ── 1. Checkout repo của chúng ta (để có quyền tạo Release) ──
-      - name: Checkout CheatEngineEvo repo
+      # ── 1. Checkout repo của chúng ta ──
+      - name: Checkout CheatEngineEvo
         uses: actions/checkout@v4
 
-      # ── 2. Clone source CE gốc theo tag ──
+      # ── 2. Clone source CE gốc theo đúng tag ──
       - name: Clone Cheat Engine source (tag ${{ env.CE_TAG }})
         shell: pwsh
         run: |
-          git clone --depth 1 --branch ${{ env.CE_TAG }} `
+          git clone --depth 1 --branch "${{ env.CE_TAG }}" `
             https://github.com/cheat-engine/cheat-engine.git `
             ce-source
-          Write-Host "✅ CE source cloned at tag ${{ env.CE_TAG }}"
+          Write-Host "✅ Cloned CE at tag ${{ env.CE_TAG }}"
 
-      # ── 3. Cache thư mục Lazarus đã cài ──
-      - name: Cache Lazarus installation
-        id: cache-lazarus
-        uses: actions/cache@v4
+      # ── 3. Cài Lazarus bằng action chuyên dụng (có cache tích hợp) ──
+      - name: Setup Lazarus 3.6
+        uses: gcarreno/setup-lazarus@v3
         with:
-          path: C:\lazarus
-          key: lazarus-${{ env.LAZARUS_VERSION }}-fpc-${{ env.FPC_VERSION }}-win64-installed
+          lazarus-version: '3.6'
+          with-cache: true
 
-      # ── 4. Download & Install Lazarus (nếu chưa có cache) ──
-      - name: Download & Install Lazarus ${{ env.LAZARUS_VERSION }}
-        if: steps.cache-lazarus.outputs.cache-hit != 'true'
+      # ── 4. Kiểm tra Lazarus đã cài thành công ──
+      - name: Verify Lazarus
         shell: pwsh
         run: |
-          $version  = "${{ env.LAZARUS_VERSION }}"
-          $fpcVer   = "${{ env.FPC_VERSION }}"
-          $filename = "lazarus-$version-fpc-$fpcVer-win64.exe"
-
-          # Danh sách mirror SourceForge (URL trực tiếp, không dùng /download redirect)
-          $mirrors = @(
-            "https://downloads.sourceforge.net/project/lazarus/Lazarus%20Windows%2064%20bits/Lazarus%20$version/$filename",
-            "https://freefr.dl.sourceforge.net/project/lazarus/Lazarus%20Windows%2064%20bits/Lazarus%20$version/$filename",
-            "https://netix.dl.sourceforge.net/project/lazarus/Lazarus%20Windows%2064%20bits/Lazarus%20$version/$filename",
-            "https://phoenixnap.dl.sourceforge.net/project/lazarus/Lazarus%20Windows%2064%20bits/Lazarus%20$version/$filename"
-          )
-
-          $downloaded = $false
-          foreach ($url in $mirrors) {
-            Write-Host "⬇️  Trying mirror: $url"
-            try {
-              Invoke-WebRequest -Uri $url -OutFile "lazarus-installer.exe" `
-                -UseBasicParsing -TimeoutSec 180 -ErrorAction Stop
-
-              # Xác nhận file là PE executable (magic bytes: 4D 5A = "MZ")
-              $header = [System.IO.File]::ReadAllBytes("lazarus-installer.exe")[0..1]
-              if ($header[0] -eq 0x4D -and $header[1] -eq 0x5A) {
-                $sizeMB = [math]::Round((Get-Item "lazarus-installer.exe").Length / 1MB, 1)
-                Write-Host "✅ Valid EXE downloaded ($sizeMB MB)"
-                $downloaded = $true
+          $lazbuild = Get-Command lazbuild -ErrorAction SilentlyContinue
+          if (-not $lazbuild) {
+            # Thử tìm trong các vị trí thông thường
+            $candidates = @(
+              "C:\lazarus\lazbuild.exe",
+              "C:\Program Files\Lazarus\lazbuild.exe",
+              "C:\Program Files (x86)\Lazarus\lazbuild.exe"
+            )
+            foreach ($c in $candidates) {
+              if (Test-Path $c) {
+                Write-Host "Found lazbuild at: $c"
+                echo "$([System.IO.Path]::GetDirectoryName($c))" >> $env:GITHUB_PATH
+                $lazbuild = $c
                 break
               }
-              Write-Warning "⚠️  File is not a valid EXE (probably HTML redirect). Trying next mirror..."
-            } catch {
-              Write-Warning "⚠️  Mirror failed: $_"
             }
           }
+          if (-not $lazbuild) { throw "lazbuild not found!" }
+          & lazbuild --version
+          Write-Host "✅ Lazarus ready"
 
-          if (-not $downloaded) {
-            # Fallback: Chocolatey
-            Write-Host "📦 All SourceForge mirrors failed — using Chocolatey..."
-            choco install lazarus --version=$version -y --no-progress
-            if ($LASTEXITCODE -ne 0) { throw "Chocolatey install of Lazarus failed" }
-            Write-Host "✅ Lazarus installed via Chocolatey"
-            exit 0
-          }
-
-          # Chạy installer Inno Setup silently
-          Write-Host "🔧 Running Lazarus installer..."
-          $proc = Start-Process -FilePath (Resolve-Path "lazarus-installer.exe") `
-            -ArgumentList "/verysilent", "/norestart", "/dir=C:\lazarus" `
-            -Wait -PassThru -NoNewWindow
-          if ($proc.ExitCode -ne 0) {
-            throw "Lazarus installer exited with code $($proc.ExitCode)"
-          }
-          Write-Host "✅ Lazarus installed to C:\lazarus"
-
-      # ── 6. Verify Lazarus installation ──
-      - name: Verify Lazarus installation
-        shell: cmd
+      # ── 5. Liệt kê build modes có sẵn trong project ──
+      - name: List available build modes
+        shell: pwsh
         run: |
-          if not exist "C:\lazarus\lazbuild.exe" (
-            echo ❌ lazbuild.exe not found!
-            dir C:\lazarus\
-            exit /b 1
-          )
-          C:\lazarus\lazbuild.exe --version
-          echo ✅ lazbuild OK
+          $lpi = "ce-source\Cheat Engine\cheatengine.lpi"
+          if (Test-Path $lpi) {
+            Write-Host "=== Build modes in cheatengine.lpi ==="
+            Select-String -Path $lpi -Pattern 'Name="[^"]*"' |
+              Where-Object { $_.Line -match 'BuildModes|Mode Name' } |
+              ForEach-Object { Write-Host $_.Line.Trim() }
+            # Hiện toàn bộ BuildModes section
+            $content = Get-Content $lpi -Raw
+            if ($content -match '(?s)<BuildModes>(.*?)</BuildModes>') {
+              $Matches[1] -split "`n" | Where-Object { $_ -match 'Item' } |
+                ForEach-Object { Write-Host $_.Trim() }
+            }
+          } else {
+            Write-Warning "LPI file not found at: $lpi"
+            Get-ChildItem "ce-source" -Recurse -Filter "*.lpi" |
+              Select-Object FullName
+          }
 
-      # ── 7. Build dự án CE 32-bit ──
+      # ── 6. Build 32-bit ──
       - name: Build CheatEngine 32-bit
         shell: cmd
         working-directory: ce-source
         run: |
-          echo ===== Building Cheat Engine 32-bit =====
-          "C:\lazarus\lazbuild.exe" "Cheat Engine\cheatengine.lpi" ^
-            --build-all ^
-            --build-mode="Release 32-Bit" ^
-            --os=win32 --cpu=i386
-          echo ✅ 32-bit build done
+          echo ===== Building 32-bit =====
+          lazbuild "Cheat Engine\cheatengine.lpi" --build-all --build-mode="Release 32-Bit"
+          if errorlevel 1 (
+            echo Trying fallback build mode name...
+            lazbuild "Cheat Engine\cheatengine.lpi" --build-all --build-mode="Release"
+          )
+          echo Done.
 
-      # ── 8. Build dự án CE 64-bit ──
+      # ── 7. Build 64-bit ──
       - name: Build CheatEngine 64-bit
         shell: cmd
         working-directory: ce-source
         run: |
-          echo ===== Building Cheat Engine 64-bit =====
-          "C:\lazarus\lazbuild.exe" "Cheat Engine\cheatengine.lpi" ^
-            --build-all ^
-            --build-mode="Release 64-Bit" ^
-            --os=win64 --cpu=x86_64
-          echo ✅ 64-bit build done
+          echo ===== Building 64-bit =====
+          lazbuild "Cheat Engine\cheatengine.lpi" --build-all --build-mode="Release 64-Bit"
+          if errorlevel 1 (
+            echo Trying fallback build mode name...
+            lazbuild "Cheat Engine\cheatengine.lpi" --build-all --os=win64 --cpu=x86_64
+          )
+          echo Done.
 
-      # ── 9. Liệt kê thư mục output ──
+      # ── 8. Tìm và liệt kê output binaries ──
       - name: List build output
         shell: pwsh
         run: |
-          Write-Host "=== Build output tree ==="
-          Get-ChildItem -Recurse "ce-source\Cheat Engine\bin" -ErrorAction SilentlyContinue |
-            Select-Object FullName, Length | Format-Table -AutoSize
+          Write-Host "=== Searching for built binaries ==="
+          Get-ChildItem "ce-source" -Recurse -Include "*.exe","*.dll" |
+            Where-Object { $_.DirectoryName -match 'bin|output|release' -or $_.Name -match 'cheat' } |
+            Select-Object FullName, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}} |
+            Format-Table -AutoSize
 
-      # ── 10. Package artifacts ──
+      # ── 9. Package artifacts ──
       - name: Package build artifacts
         shell: pwsh
         run: |
-          $tag = "${{ env.CE_TAG }}"
+          $tag    = "${{ env.CE_TAG }}"
           $binDir = "ce-source\Cheat Engine\bin"
-
-          # Tạo thư mục output
           New-Item -ItemType Directory -Force -Path "dist" | Out-Null
 
-          # Zip toàn bộ bin folder
-          if (Test-Path $binDir) {
-            Compress-Archive -Path "$binDir\*" -DestinationPath "dist\CheatEngineEvo-$tag-windows.zip" -Force
-            Write-Host "✅ Packaged: dist\CheatEngineEvo-$tag-windows.zip"
-          } else {
-            Write-Error "❌ Build output directory not found: $binDir"
-            exit 1
+          # Tìm thư mục output nếu không phải 'bin'
+          if (-not (Test-Path $binDir)) {
+            $found = Get-ChildItem "ce-source" -Recurse -Directory |
+              Where-Object { $_.Name -in @('bin','output','Release') } |
+              Select-Object -First 1
+            if ($found) {
+              $binDir = $found.FullName
+              Write-Host "Using output dir: $binDir"
+            } else {
+              throw "Cannot find build output directory!"
+            }
           }
 
-          # Tạo README ngắn gọn
-          @"
-          # CheatEngine Evo - Windows Build
-          
-          **Source version:** ${{ env.CE_VERSION }}
-          **Built from tag:** $tag
-          **Built by:** CheatEngineEvo CI
-          **Date:** $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')
-          
-          ## Files
-          - \`CheatEngineEvo-$tag-windows.zip\` — Windows binaries (32-bit + 64-bit)
-          
-          ## Source
-          Official Cheat Engine: https://github.com/cheat-engine/cheat-engine/tree/$tag
-          "@ | Out-File -Encoding UTF8 "dist\RELEASE_NOTES.md"
+          $zipPath = "dist\CheatEngineEvo-$tag-windows.zip"
+          Compress-Archive -Path "$binDir\*" -DestinationPath $zipPath -Force
+          $sizeMB = [math]::Round((Get-Item $zipPath).Length / 1MB, 1)
+          Write-Host "✅ Packaged: $zipPath ($sizeMB MB)"
 
-      # ── 11. Upload artifacts tạm thời (giữa jobs) ──
-      - name: Upload build artifacts
+      # ── 10. Upload artifact ──
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ce-windows-${{ env.CE_TAG }}
@@ -245,9 +214,7 @@ jobs:
   create-release:
     name: 📦 Create GitHub Release
     runs-on: ubuntu-latest
-    needs:
-      - check-version
-      - build-windows
+    needs: [check-version, build-windows]
     if: needs.check-version.outputs.should_build == 'true'
     permissions:
       contents: write
@@ -257,43 +224,34 @@ jobs:
       CE_VERSION: ${{ needs.check-version.outputs.ce_version }}
 
     steps:
-      # ── 1. Download artifact từ job build ──
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: ce-windows-${{ env.CE_TAG }}
           path: dist/
 
-      - name: List downloaded files
-        run: ls -lh dist/
-
-      # ── 2. Đọc release notes ──
-      - name: Read release notes
-        id: notes
-        run: |
-          if [ -f "dist/RELEASE_NOTES.md" ]; then
-            NOTES=$(cat dist/RELEASE_NOTES.md)
-          else
-            NOTES="Automated build of Cheat Engine ${{ env.CE_VERSION }} for Windows."
-          fi
-          # Lưu vào file để tránh vấn đề escape
-          echo "$NOTES" > release_body.md
-          echo "✅ Release notes ready"
-
-      # ── 3. Tạo GitHub Release và upload file ──
-      - name: Create GitHub Release
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "CE-${{ env.CE_TAG }}"
-          name: "CheatEngine Evo ${{ env.CE_VERSION }} (Windows)"
-          body_path: release_body.md
+          tag_name:  "CE-${{ env.CE_TAG }}"
+          name:      "CheatEngine Evo ${{ env.CE_VERSION }} (Windows)"
+          body: |
+            ## CheatEngine Evo — Windows Build
+
+            | | |
+            |---|---|
+            | **Source** | [cheat-engine/cheat-engine @ ${{ env.CE_TAG }}](https://github.com/cheat-engine/cheat-engine/tree/${{ env.CE_TAG }}) |
+            | **Built with** | Lazarus 3.6 / FPC 3.2.2 |
+            | **Platform** | Windows 32-bit + 64-bit |
+
+            ### Files
+            - `CheatEngineEvo-${{ env.CE_TAG }}-windows.zip` — Windows binaries
+
+            > Built automatically by [CheatEngineEvo CI](https://github.com/${{ github.repository }}/actions)
           draft: false
           prerelease: false
-          files: |
-            dist/CheatEngineEvo-${{ env.CE_TAG }}-windows.zip
+          files: dist/CheatEngineEvo-${{ env.CE_TAG }}-windows.zip
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: ✅ Release created successfully
-        run: |
-          echo "🎉 Release CE-${{ env.CE_TAG }} created!"
-          echo "🔗 https://github.com/${{ github.repository }}/releases/tag/CE-${{ env.CE_TAG }}"
+      - name: Done
+        run: echo "🎉 Release CE-${{ env.CE_TAG }} published at https://github.com/${{ github.repository }}/releases/tag/CE-${{ env.CE_TAG }}"
