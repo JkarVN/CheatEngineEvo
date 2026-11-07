@@ -159,11 +159,17 @@ jobs:
           }
           if (-not $built) { throw "❌ All 64-bit build modes failed" }
 
-      # ── 7. Build 32-bit (optional — bỏ qua nếu fail) ──
+      # ── 7. Build 32-bit (chỉ build nếu có ppc386 compiler) ──
       - name: Build CheatEngine 32-bit
         shell: pwsh
         working-directory: ce-source
+        continue-on-error: true
         run: |
+          $fpc32 = Get-Command ppc386 -ErrorAction SilentlyContinue
+          if (-not $fpc32) {
+            Write-Host "ℹ️ 32-bit FPC compiler (ppc386) is not installed on this 64-bit runner. Skipping 32-bit build."
+            exit 0
+          }
           $lpi = "Cheat Engine\cheatengine.lpi"
           $modes = @("Release 32-Bit", "Release 32Bit")
           $built = $false
@@ -175,11 +181,8 @@ jobs:
               $built = $true
               break
             }
-            Write-Warning "Mode '$mode' failed (exit $LASTEXITCODE), trying next..."
           }
-          if (-not $built) {
-            Write-Warning "⚠️ 32-bit build failed — will continue with 64-bit only"
-          }
+          exit 0
 
 
       # ── 8. Tìm và liệt kê output binaries ──
@@ -259,11 +262,11 @@ jobs:
             | | |
             |---|---|
             | **Source** | [cheat-engine/cheat-engine @ ${{ env.CE_TAG }}](https://github.com/cheat-engine/cheat-engine/tree/${{ env.CE_TAG }}) |
-            | **Built with** | Lazarus 3.6 / FPC 3.2.2 |
-            | **Platform** | Windows 32-bit + 64-bit |
+            | **Built with** | Lazarus 2.2.6 / FPC 3.2.2 |
+            | **Platform** | Windows x86_64 (64-bit) |
 
             ### Files
-            - `CheatEngineEvo-${{ env.CE_TAG }}-windows.zip` — Windows binaries
+            - `CheatEngineEvo-${{ env.CE_TAG }}-windows.zip` — Windows 64-bit binaries
 
             > Built automatically by [CheatEngineEvo CI](https://github.com/${{ github.repository }}/actions)
           draft: false
