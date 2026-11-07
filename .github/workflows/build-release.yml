@@ -85,10 +85,11 @@ jobs:
           Write-Host "✅ Cloned CE at tag ${{ env.CE_TAG }}"
 
       # ── 3. Cài Lazarus bằng action chuyên dụng (có cache tích hợp) ──
-      - name: Setup Lazarus 3.6
+      # CE 7.5 (Feb 2023) cần Lazarus 2.2.x — Lazarus 3.x đổi LazFileUtils API
+      - name: Setup Lazarus 2.2.6
         uses: gcarreno/setup-lazarus@v3
         with:
-          lazarus-version: '3.6'
+          lazarus-version: '2.2.6'
           with-cache: true
 
       # ── 4. Kiểm tra Lazarus đã cài thành công ──
@@ -138,31 +139,48 @@ jobs:
               Select-Object FullName
           }
 
-      # ── 6. Build 32-bit ──
-      - name: Build CheatEngine 32-bit
-        shell: cmd
-        working-directory: ce-source
-        run: |
-          echo ===== Building 32-bit =====
-          lazbuild "Cheat Engine\cheatengine.lpi" --build-all --build-mode="Release 32-Bit"
-          if errorlevel 1 (
-            echo Trying fallback build mode name...
-            lazbuild "Cheat Engine\cheatengine.lpi" --build-all --build-mode="Release"
-          )
-          echo Done.
-
-      # ── 7. Build 64-bit ──
+      # ── 6. Build 64-bit (target chính) ──
       - name: Build CheatEngine 64-bit
-        shell: cmd
+        shell: pwsh
         working-directory: ce-source
         run: |
-          echo ===== Building 64-bit =====
-          lazbuild "Cheat Engine\cheatengine.lpi" --build-all --build-mode="Release 64-Bit"
-          if errorlevel 1 (
-            echo Trying fallback build mode name...
-            lazbuild "Cheat Engine\cheatengine.lpi" --build-all --os=win64 --cpu=x86_64
-          )
-          echo Done.
+          $lpi = "Cheat Engine\cheatengine.lpi"
+          $modes = @("Release 64-Bit", "Release 64Bit", "Release")
+          $built = $false
+          foreach ($mode in $modes) {
+            Write-Host "▶ Trying build mode: '$mode'"
+            lazbuild $lpi --build-all --build-mode=$mode
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "✅ 64-bit build succeeded with mode: '$mode'"
+              $built = $true
+              break
+            }
+            Write-Warning "Mode '$mode' failed (exit $LASTEXITCODE), trying next..."
+          }
+          if (-not $built) { throw "❌ All 64-bit build modes failed" }
+
+      # ── 7. Build 32-bit (optional — bỏ qua nếu fail) ──
+      - name: Build CheatEngine 32-bit
+        shell: pwsh
+        working-directory: ce-source
+        run: |
+          $lpi = "Cheat Engine\cheatengine.lpi"
+          $modes = @("Release 32-Bit", "Release 32Bit")
+          $built = $false
+          foreach ($mode in $modes) {
+            Write-Host "▶ Trying build mode: '$mode'"
+            lazbuild $lpi --build-all --build-mode=$mode
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "✅ 32-bit build succeeded with mode: '$mode'"
+              $built = $true
+              break
+            }
+            Write-Warning "Mode '$mode' failed (exit $LASTEXITCODE), trying next..."
+          }
+          if (-not $built) {
+            Write-Warning "⚠️ 32-bit build failed — will continue with 64-bit only"
+          }
+
 
       # ── 8. Tìm và liệt kê output binaries ──
       - name: List build output
